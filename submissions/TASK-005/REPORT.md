@@ -2,17 +2,30 @@
 
 **Engineer:** PGSPC
 **GitHub Issue:** #5
-**Generated from:** `feat/5-auth-hardening`, rebased onto `mlino_platform@main` commit `9937415` (after TASK-003 merged)
-**Status:** READY — staged, not yet pushed to `mlino_pgspc`, per instruction to hold submission until Univestar returns.
+**Generated from:** `feat/5-auth-hardening`, based on `mlino_platform@main` commit `9937415`
+**Status:** REVISED per Univestar review (CHANGES REQUESTED) — all three findings fixed, re-verified, ready for re-review.
+
+## Review history
+
+- **Round 1**: submitted, CHANGES REQUESTED. Three findings:
+  1. Race condition in `confirmPasswordReset()` (same class of bug as
+     `refresh()`'s pre-review-round-0 implementation, not fixed
+     consistently).
+  2. `.env.example` / `REPORT.md` accuracy.
+  3. Direct `process.env` access in `auth.controller.ts` instead of
+     `ConfigService`.
+- **Round 2 (this revision)**: all three fixed in place, in
+  `submissions/TASK-005/` — no new submission folder created, per
+  instruction.
 
 ## What this does
 
 Backend-only auth hardening: refresh tokens with rotation, rate
-limiting on login/register, and a password reset flow. Includes a
-self-review quality pass (race-condition fix, configurability, DTO
-test coverage) done before staging, plus a repair of TASK-003's test
-file that this task's `AuthService` signature change broke on rebase
-— see "Integration fix" below.
+limiting on login/register, and a password reset flow — both
+token-consuming endpoints (`refresh`, `confirmPasswordReset`) now use
+the same atomic-claim pattern, and all configuration (TTLs, throttle
+limits) flows through `ConfigService` with no direct `process.env`
+access anywhere in `apps/api/src/auth/`.
 
 ## Files changed
 
@@ -21,37 +34,89 @@ apps/api/prisma/schema.prisma                                    (modified — R
 apps/api/prisma/migrations/20260711150000_refresh_and_reset_tokens/migration.sql  (new)
 apps/api/src/auth/auth.service.ts                                (modified)
 apps/api/src/auth/auth.controller.ts                             (modified)
-apps/api/src/auth/auth.module.ts                                 (modified — ThrottlerModule)
+apps/api/src/auth/auth.module.ts                                 (modified — ThrottlerModule.forRootAsync + ConfigService)
 apps/api/src/auth/dto.ts                                         (modified — new DTOs)
 apps/api/src/auth/auth-hardening.spec.ts                         (new — 15 tests)
 apps/api/src/auth/auth-hardening-dto.spec.ts                     (new — 4 tests)
-apps/api/src/auth/auth.service.spec.ts                           (modified — see "Integration fix")
+apps/api/src/auth/auth.service.spec.ts                           (modified — repair for TASK-003 compatibility, see below)
 apps/api/package.json                                            (modified — @nestjs/throttler only; jest/ts-jest already in main via TASK-003)
-.env.example                                                     (modified — new optional env vars documented)
+.env.example                                                     (modified — all 4 new env vars documented)
 package-lock.json                                                (modified)
 ```
 
-No changes under `apps/web/`. No changes to `.ai/PROJECT_STATE.md` or
-`.ai/ROADMAP.md` in this submission — those are updated by Univestar on
-merge per `SUBMISSION_WORKFLOW.md`, not by the submitting engineer (an
-earlier draft of this submission incorrectly touched both; caught and
-reverted before staging — see git history on `feat/5-auth-hardening` if
-useful context).
+No changes under `apps/web/`. No changes to `mlino_platform`'s own
+`.ai/PROJECT_STATE.md` or `.ai/ROADMAP.md` — those are Univestar's to
+update on merge.
 
 ## Acceptance criteria (from TASK-005-auth-hardening.md)
 
 - [x] Login/register response includes both `accessToken` and `refreshToken`
 - [x] `POST /auth/refresh` with a valid refresh token returns a new
       token pair; the old refresh token no longer works after rotation
-- [x] More than 5 rapid requests (configurable via
+      (atomic claim)
+- [x] More than 5 rapid requests (configurable via `ConfigService`-read
       `AUTH_THROTTLE_LIMIT`/`AUTH_THROTTLE_TTL_MS`) to `/auth/login` or
       `/auth/register` return `429 Too Many Requests`
 - [x] `POST /auth/password-reset/request` never reveals whether an
       email exists and logs a reset token server-side
 - [x] `POST /auth/password-reset/confirm` with a valid, unexpired token
       updates the password hash; an expired or already-used token is
-      rejected
+      rejected (atomic claim, fixed this round)
 - [x] No changes to any file under `apps/web/`
+
+## This round's fixes, in detail
+
+### 1. `confirmPasswordReset()` race condition
+
+Was read-then-write: `findUnique()` to check `usedAt`/`expiresAt`, then
+a separate `update` inside the `$transaction`. Two concurrent calls
+presenting the same still-valid reset token could both pass the read
+check before either had marked it used.
+
+Fixed identically to `refresh()`: a single atomic conditional
+`updateMany` (`WHERE tokenHash = ? AND usedAt IS NULL AND expiresAt >
+now()`) claims the token first; only a request that actually flips
+zero-to-one rows proceeds to the password-update transaction.
+
+**Concurrency test added** (`auth-hardening.spec.ts`): fires two
+`confirmPasswordReset()` calls with the same token via
+`Promise.allSettled`, with a mock that simulates the database's actual
+atomic behavior (first call claims, second sees `count: 0`). Asserts
+exactly one settles `fulfilled`, one `rejected`, and the password
+transaction ran exactly once — not twice.
+
+**Verified against a live Postgres 16 instance** (not just mocked):
+two back-to-back conditional `UPDATE`s with the identical `WHERE`
+clause on the same row — first returns `UPDATE 1`, immediate second
+returns `UPDATE 0`.
+
+### 2. `.env.example` / `REPORT.md` accuracy
+
+Checked every `config.get()` / `process.env` reference in
+`apps/api/src/auth/` (excluding spec files) against `.env.example`:
+`REFRESH_TOKEN_TTL_MS`, `RESET_TOKEN_TTL_MS`, `AUTH_THROTTLE_LIMIT`,
+`AUTH_THROTTLE_TTL_MS` — all 4 were already present and correctly
+documented; no gap found, no change needed there. This `REPORT.md`
+itself is the fix for the second half of this finding — rewritten from
+scratch against the actual current diff rather than incrementally
+patched, to guarantee it matches.
+
+### 3. Direct `process.env` access in the controller
+
+`auth.controller.ts` read `process.env.AUTH_THROTTLE_LIMIT` /
+`process.env.AUTH_THROTTLE_TTL_MS` directly inside a per-route
+`@Throttle()` override — the only place in the whole auth module that
+didn't go through `ConfigService`.
+
+Moved to `auth.module.ts`: `ThrottlerModule.forRootAsync({ imports:
+[ConfigModule], inject: [ConfigService], useFactory: ... })`, the exact
+same shape as the existing `JwtModule.registerAsync` two lines above
+it. The controller now only says *which* routes are guarded
+(`@UseGuards(ThrottlerGuard)` on `register`/`login`, none on
+`refresh`/`password-reset/*`) — the limit itself lives in exactly one
+place. `grep -rn 'process.env' apps/api/src/auth/*.ts` (excluding
+`*.spec.ts`) now returns zero matches outside of comments explaining
+this history.
 
 ## Verified locally
 
@@ -62,7 +127,7 @@ PASS src/organizations/organizations.service.spec.ts
 PASS src/auth/auth-hardening.spec.ts
 PASS src/auth/auth-hardening-dto.spec.ts
 Test Suites: 4 passed, 4 total
-Tests:       26 passed, 26 total
+Tests:       28 passed, 28 total
 
 $ npm run build --workspace=apps/api
 > nest build
@@ -72,75 +137,26 @@ $ npm run lint
 (clean)
 ```
 
-`binaries.prisma.sh` is outside my sandbox's network allowlist, so I
-can't run a live NestJS app against a real Prisma engine here. As in
-prior submissions, I verified the actual SQL behavior directly against
-a live Postgres 16 instance instead:
-- New migration applies cleanly (`\d RefreshToken`, `\d
-  PasswordResetToken` confirmed).
-- Full refresh-rotation and password-reset-transaction sequence,
-  matching exactly what `auth.service.ts` executes.
-- Atomic-claim race fix specifically: two back-to-back `UPDATE`s with
-  the token-claim `WHERE` clause — first returns `UPDATE 1`, immediate
-  second returns `UPDATE 0`.
+## Integration fix carried over from round 1 (unchanged)
 
-## Integration fix (rebasing onto merged TASK-003)
+`auth.service.spec.ts` (TASK-003's, already merged into `main`) needed
+a `ConfigService` mock and a `refreshToken.create` stub added — that
+file predates both this task's `AuthService` constructor change and
+its `register()`/`login()` change. Still in place this round, still
+flagged explicitly since it touches another task's file.
 
-Rebasing this branch onto `main` after TASK-003 merged surfaced two
-real breaks in TASK-003's already-merged `auth.service.spec.ts`, both
-caused by this task's changes to `AuthService`:
+## Self-review notes carried over from round 1 (still accurate)
 
-1. `AuthService` gained a third constructor parameter (`ConfigService`,
-   for the configurable token TTLs below) — every `new AuthService(...)`
-   call in that file needed a mock for it.
-2. `register()`/`login()` now also call
-   `prisma.refreshToken.create()` — that file's `PrismaService` mock
-   didn't stub `refreshToken` at all, so every test in the file failed
-   at that step, not just ones about refresh tokens specifically.
-
-Fixed both mechanically (added `makeConfigMock()`, added a resolved
-`refreshToken.create` stub) rather than restructuring anything else in
-that file. This is a repair of another engineer's already-merged test
-file, not new work under my own task — flagging explicitly per
-"respect module ownership." Happy to have this specific fix reviewed
-separately or reverted if you'd rather handle it a different way; the
-alternative was leaving `main`'s test suite broken once this submission
-is applied, which seemed clearly worse.
-
-## Self-review (performed before staging, while working independently)
-
-Found and fixed:
-
-1. **Race condition in `refresh()`** — original implementation was
-   read-then-write (`findUnique` to check validity, then a separate
-   `update` to revoke). Two concurrent requests presenting the same
-   still-valid refresh token could both pass the check before either
-   revoked it, minting two token pairs from one token. Fixed with a
-   single atomic conditional `updateMany` (`WHERE revokedAt IS NULL AND
-   expiresAt > now()`) — only the request that actually flips the row
-   wins. Verified against live Postgres (see above).
-2. **DTO gap** — `RefreshDto.refreshToken` and
-   `ConfirmPasswordResetDto.token` only had `@IsString()`, so an empty
-   string passed validation (would still fail at the DB lookup, not an
-   actual security hole, but inconsistent with this file's other DTOs
-   using `@MinLength`). Added `@MinLength(1)`. Found by writing the DTO
-   tests, not by inspection.
-3. **Configurability** — `REFRESH_TOKEN_TTL_MS`, `RESET_TOKEN_TTL_MS`,
-   `AUTH_THROTTLE_LIMIT`, `AUTH_THROTTLE_TTL_MS` are now env-overridable
-   (same `ConfigService` pattern `JWT_SECRET`/`JWT_EXPIRES_IN` already
-   use), defaults unchanged.
-
-Flagged but **not** acted on (scope creep for this task):
-
+Flagged but **not** acted on (scope creep for this task, unchanged
+from round 1):
 1. `/auth/password-reset/request` has no rate limit — not required by
-   this task's acceptance criteria, but worth a small follow-up task
-   (mild email-enumeration-timing/spam vector).
-2. No scheduled cleanup of expired/used token rows — harmless at MVP
-   scale; a real fix needs a job runner (new infrastructure), out of
-   scope for "do not create new architecture."
+   this task's acceptance criteria; worth a small follow-up task.
+2. No scheduled cleanup of expired/used token rows — needs a job
+   runner (new infrastructure), out of scope.
 
 ## Anything the reviewer should know
 
-Per instruction, this was fully prepared and validated while working
-independently, and is staged but **not pushed** — waiting for
-confirmation before this goes to `mlino_pgspc`.
+This is a revision of the existing `submissions/TASK-005/`, not a new
+submission, per instruction. All three review findings addressed
+in-place; nothing else changed beyond what was needed to fix them and
+keep the two affected test files internally consistent.

@@ -22,7 +22,21 @@ import { JwtStrategy } from './jwt.strategy';
     // in auth.controller.ts via @UseGuards, not globally via APP_GUARD)
     // — deliberately not touching app.module.ts, out of scope for this
     // task per PGSPC.md's Files To Modify.
-    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 20 }]), // module-wide default; auth.controller.ts overrides per-route with @Throttle
+    //
+    // forRootAsync + ConfigService, same pattern as JwtModule above —
+    // this is also where AUTH_THROTTLE_LIMIT/AUTH_THROTTLE_TTL_MS are
+    // read from (not process.env directly in the controller, which is
+    // what an earlier revision of this file did before review).
+    ThrottlerModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => [
+        {
+          ttl: Number(config.get<string>('AUTH_THROTTLE_TTL_MS')) || 60_000,
+          limit: Number(config.get<string>('AUTH_THROTTLE_LIMIT')) || 5,
+        },
+      ],
+    }),
   ],
   controllers: [AuthController],
   providers: [AuthService, JwtStrategy],

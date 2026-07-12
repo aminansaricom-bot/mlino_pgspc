@@ -158,19 +158,37 @@ export class AuthService {
     return { message: 'اگر این ایمیل در سیستم ثبت باشد، لینک بازیابی رمز عبور برایش ارسال می‌شود.' };
   }
 
+  // Same atomic-claim pattern as refresh() and for the same reason:
+  // the token is claimed with a single conditional UPDATE (usedAt IS
+  // NULL AND expiresAt > now), not a read-then-write. Without this,
+  // two concurrent confirmPasswordReset() calls presenting the same
+  // still-valid reset token could both pass a plain findUnique()
+  // check before either had marked it used, running the password
+  // update + refresh-token revocation twice.
   async confirmPasswordReset(dto: ConfirmPasswordResetDto): Promise<{ message: string }> {
     const tokenHash = hashToken(dto.token);
-    const stored = await this.prisma.passwordResetToken.findUnique({ where: { tokenHash } });
+    const now = new Date();
 
-    if (!stored || stored.usedAt || stored.expiresAt < new Date()) {
+    const claimed = await this.prisma.passwordResetToken.updateMany({
+      where: { tokenHash, usedAt: null, expiresAt: { gt: now } },
+      data: { usedAt: now },
+    });
+
+    if (claimed.count === 0) {
+      throw new UnauthorizedException('توکن بازیابی نامعتبر یا منقضی شده است');
+    }
+
+    const stored = await this.prisma.passwordResetToken.findUnique({ where: { tokenHash } });
+    if (!stored) {
       throw new UnauthorizedException('توکن بازیابی نامعتبر یا منقضی شده است');
     }
 
     const passwordHash = await bcrypt.hash(dto.newPassword, 10);
 
+    // usedAt is already claimed above, so the transaction only needs
+    // the two remaining effects of a password reset.
     await this.prisma.$transaction([
       this.prisma.user.update({ where: { id: stored.userId }, data: { passwordHash } }),
-      this.prisma.passwordResetToken.update({ where: { id: stored.id }, data: { usedAt: new Date() } }),
       // A password reset is a strong signal the account may have been
       // compromised — revoke every outstanding refresh token so a
       // stolen session can't outlive the password change.

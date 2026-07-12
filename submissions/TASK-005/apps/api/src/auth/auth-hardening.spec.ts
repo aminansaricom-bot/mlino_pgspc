@@ -9,7 +9,7 @@ function makePrismaMock() {
   return {
     user: { findUnique: jest.fn(), create: jest.fn(), update: jest.fn() },
     refreshToken: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
-    passwordResetToken: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
+    passwordResetToken: { create: jest.fn(), findUnique: jest.fn(), update: jest.fn(), updateMany: jest.fn() },
     $transaction: jest.fn((ops: unknown[]) => Promise.all(ops)),
   } as unknown as PrismaService;
 }
@@ -146,52 +146,97 @@ describe('AuthService — password reset', () => {
     expect(prisma.passwordResetToken.create).toHaveBeenCalledTimes(1);
   });
 
-  it('confirmPasswordReset updates the password with a valid token', async () => {
+  it('confirmPasswordReset atomically claims a valid token, then updates the password', async () => {
     const prisma = makePrismaMock();
-    (prisma.passwordResetToken.findUnique as jest.Mock).mockResolvedValue({
-      id: 'prt-1',
-      userId: 'u1',
-      usedAt: null,
-      expiresAt: new Date(Date.now() + 100_000),
-    });
+    (prisma.passwordResetToken.updateMany as jest.Mock).mockResolvedValue({ count: 1 }); // claim succeeded
+    (prisma.passwordResetToken.findUnique as jest.Mock).mockResolvedValue({ id: 'prt-1', userId: 'u1' });
     const service = new AuthService(prisma, makeJwtMock(), makeConfigMock());
 
     const result = await service.confirmPasswordReset({ token: 'valid-token', newPassword: 'newpassword123' });
 
     expect(result.message).toBeDefined();
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    // the claim is conditional on usedAt: null AND expiresAt in the
+    // future — this is what makes it atomic instead of read-then-write,
+    // same pattern as refresh()'s RefreshToken claim.
+    expect(prisma.passwordResetToken.updateMany).toHaveBeenCalledWith({
+      where: { tokenHash: expect.any(String), usedAt: null, expiresAt: { gt: expect.any(Date) } },
+      data: { usedAt: expect.any(Date) },
+    });
   });
 
-  it('confirmPasswordReset rejects an already-used token', async () => {
+  it('confirmPasswordReset rejects an already-used token — the conditional claim can never match it', async () => {
     const prisma = makePrismaMock();
-    (prisma.passwordResetToken.findUnique as jest.Mock).mockResolvedValue({
-      id: 'prt-1',
-      userId: 'u1',
-      usedAt: new Date(),
-      expiresAt: new Date(Date.now() + 100_000),
-    });
+    // usedAt: null in the WHERE clause means an already-used row can
+    // never be matched again:
+    (prisma.passwordResetToken.updateMany as jest.Mock).mockResolvedValue({ count: 0 });
     const service = new AuthService(prisma, makeJwtMock(), makeConfigMock());
 
     await expect(
       service.confirmPasswordReset({ token: 'already-used', newPassword: 'newpassword123' }),
     ).rejects.toThrow(UnauthorizedException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
-  it('confirmPasswordReset rejects an expired token', async () => {
+  it('confirmPasswordReset rejects an expired token — the conditional claim can never match it', async () => {
     const prisma = makePrismaMock();
-    (prisma.passwordResetToken.findUnique as jest.Mock).mockResolvedValue({
-      id: 'prt-1',
-      userId: 'u1',
-      usedAt: null,
-      expiresAt: new Date(Date.now() - 1_000),
-    });
+    // expiresAt: { gt: now } in the WHERE clause means an expired row
+    // can never be matched:
+    (prisma.passwordResetToken.updateMany as jest.Mock).mockResolvedValue({ count: 0 });
     const service = new AuthService(prisma, makeJwtMock(), makeConfigMock());
 
     await expect(service.confirmPasswordReset({ token: 'expired', newPassword: 'newpassword123' })).rejects.toThrow(
       UnauthorizedException,
     );
   });
+
+  // Concurrency proof, mirroring the equivalent refresh() test: two
+  // "simultaneous" confirmPasswordReset() calls presenting the exact
+  // same reset token. Only the atomic conditional UPDATE decides which
+  // one wins — the second must see count:0 and be rejected, never run
+  // the password-update transaction. This is the specific scenario the
+  // review flagged as unresolved before this fix.
+  it('under concurrent calls with the same token, exactly one succeeds and the other is rejected', async () => {
+    const prisma = makePrismaMock();
+    // Simulate the database's actual behavior under a race: the first
+    // caller to reach the conditional UPDATE claims the row (count:1);
+    // by the time the second caller's UPDATE runs, usedAt is no longer
+    // null, so its WHERE clause matches zero rows (count:0). This is
+    // exactly what a real conditional UPDATE guarantees atomically —
+    // see the live-Postgres verification in the PR description for the
+    // same guarantee proven directly against a real database, not just
+    // mocked here.
+    let claimed = false;
+    (prisma.passwordResetToken.updateMany as jest.Mock).mockImplementation(async () => {
+      if (claimed) return { count: 0 };
+      claimed = true;
+      return { count: 1 };
+    });
+    (prisma.passwordResetToken.findUnique as jest.Mock).mockResolvedValue({ id: 'prt-1', userId: 'u1' });
+    const service = new AuthService(prisma, makeJwtMock(), makeConfigMock());
+
+    const [first, second] = await Promise.allSettled([
+      service.confirmPasswordReset({ token: 'same-token', newPassword: 'newpassword123' }),
+      service.confirmPasswordReset({ token: 'same-token', newPassword: 'newpassword123' }),
+    ]);
+
+    const outcomes = [first.status, second.status].sort();
+    expect(outcomes).toEqual(['fulfilled', 'rejected']);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1); // the password-update side effect ran exactly once
+  });
+
+  it('confirmPasswordReset rejects a claimed token that vanished before the follow-up lookup (defensive check)', async () => {
+    const prisma = makePrismaMock();
+    (prisma.passwordResetToken.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
+    (prisma.passwordResetToken.findUnique as jest.Mock).mockResolvedValue(null);
+    const service = new AuthService(prisma, makeJwtMock(), makeConfigMock());
+
+    await expect(service.confirmPasswordReset({ token: 'vanished', newPassword: 'newpassword123' })).rejects.toThrow(
+      UnauthorizedException,
+    );
+  });
 });
+
 
 // Sanity check on the bcrypt claim in the module comment: passwords
 // hashed by bcrypt.hash must verify with bcrypt.compare.
