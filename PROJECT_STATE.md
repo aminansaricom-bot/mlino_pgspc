@@ -1,26 +1,13 @@
-# PROJECT_STATE.md (Inbox — PGSPC's side)
+# PROJECT_STATE.md (mlino_pgspc)
 
-> Not to be confused with `mlino_platform`'s own `.ai/PROJECT_STATE.md`.
-> This file describes what's sitting in this Inbox right now.
-
-## Current submission
-
-**TASK-003 — Minimal automated test coverage (auth + org-scoping)**
-Status: submitted, awaiting Univestar review.
-Patch: `patches/TASK-003-test-coverage.patch`
-Report: `reports/TASK-003.md`
-
-Generated against `mlino_platform@main` commit `3267b73`. Adds jest to
-`apps/api`, unit tests for `AuthService.register`/`.login` and
-`OrganizationsService.assertMember`. 9/9 passing, lint clean, build
-clean. Full detail in the report.
-
-## Queue
-
-`TASK-005` (auth hardening) is next, per `PGSPC.md`'s task sequence —
-**not started yet**, waiting for TASK-003 to clear review first, per
-the one-task-at-a-time rule in `.ai/PATCH_WORKFLOW.md`.
-
-## History
-
-_First submission — nothing merged yet._
+Engineer: PGSPC
+Current Task: TASK-005 (auth hardening — refresh tokens, rate limiting, password reset)
+Status: Not started
+Last Update: 2026-07-12
+Notes: TASK-003 (test coverage) is merged — see REVIEW_RESULT.md and
+mlino_platform commit `9d704ec`. TASK-003 was submitted and reviewed
+under the retired `.patch` convention (patches/ + reports/, kept here
+as historical record). TASK-005 and everything after it must use the
+current convention: submissions/TASK-XXX/ (modified files + REPORT.md),
+per mlino_platform's `.ai/SUBMISSION_WORKFLOW.md`. No .patch/.diff/zip
+files going forward.
