@@ -5,6 +5,69 @@
 
 ---
 
+## TASK-005 — Auth hardening (backend only) — Round 2
+
+**Verdict: APPROVED**
+
+**Reviewed by:** Univestar
+**Date:** 2026-07-12
+**Integrated as:** commit `e082d9e` on `mlino_platform@main`
+
+### Independent re-review, from scratch
+
+Per instruction, round 1's review was set aside entirely and this
+submission was re-reviewed as if seeing it for the first time —
+including re-running every validation independently rather than
+trusting `REPORT.md`'s claims:
+
+- Applied all files in `submissions/TASK-005/` to a clean
+  `mlino_platform@main` checkout.
+- `npm test --workspace=apps/api`: **28/28 passing** (own re-run).
+- `npm run lint`: clean. `npm run build` (both workspaces): clean.
+- Read `auth.service.ts`, `auth.controller.ts`, `auth.module.ts`,
+  `dto.ts`, and both new spec files in full — not just the diff summary.
+- Diffed the submitted `.env.example` against the real one on `main`:
+  purely additive, 4 new documented vars, nothing else touched.
+- Confirmed `schema.prisma`/migration SQL unchanged from round 1 (byte
+  for byte) — re-validated the field-by-field cross-check against
+  `auth.service.ts` regardless, same sandbox limitation as round 1
+  (no `binaries.prisma.sh` access here, so no fully generated Prisma
+  client to typecheck against — mitigated by manual review, not a
+  reason to slow this down).
+
+### All three round-1 findings verified fixed
+
+1. **`confirmPasswordReset()` race condition** — now uses the identical
+   atomic conditional `updateMany` pattern as `refresh()`
+   (`WHERE tokenHash = ? AND usedAt IS NULL AND expiresAt > now()`,
+   proceed only if `count === 1`). A new dedicated concurrency test
+   fires two concurrent calls with the same token via
+   `Promise.allSettled`, asserting exactly one fulfills, one rejects,
+   and the password-update transaction runs exactly once — a real test
+   of the fix, not a superficial one.
+2. **`.env.example`** — present this round, purely additive, matches
+   every `config.get()` call in the auth module.
+3. **Raw `process.env` in the controller** — moved to
+   `ThrottlerModule.forRootAsync` in `auth.module.ts`, same
+   `ConfigService` pattern as the adjacent `JwtModule.registerAsync`.
+   `grep -rn 'process.env' apps/api/src/auth/*.ts` (excluding specs)
+   now returns nothing outside a comment.
+
+### Minor note, not blocking
+
+Two self-disclosed, correctly-scoped-out items carried over unchanged
+from round 1 (no rate limit on `/auth/password-reset/request`; no
+scheduled cleanup of expired token rows) — still reasonable to leave
+for a follow-up task, not this one.
+
+### Next assignment
+
+None yet — Engineering Foundations milestone (#3, #4, #5) is now
+complete. Next Sprint 1 task will be assigned by Univestar; no
+self-assignment.
+
+---
+
 ## TASK-005 — Auth hardening (backend only)
 
 **Verdict: CHANGES REQUESTED**
