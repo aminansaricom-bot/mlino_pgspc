@@ -1,0 +1,128 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+
+  organizations  OrganizationMember[]
+  refreshTokens  RefreshToken[]
+  resetTokens    PasswordResetToken[]
+}
+
+// Opaque random tokens, only the hash is stored (same principle as a
+// password: if the DB leaks, stored rows alone can't be replayed).
+// Rotation: refresh() always revokes the presented token and issues a
+// brand new pair, so a stolen-then-reused refresh token is detected
+// (its revokedAt will already be set) rather than silently accepted.
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// Password reset flow. No email provider configured for MVP — the raw
+// token is logged server-side (see auth.service.ts requestPasswordReset,
+// same pattern as malino-17tir's lib/sms.js stub) rather than emailed.
+model PasswordResetToken {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+
+  members       OrganizationMember[]
+  partners      Partner[]
+  conversations Conversation[]
+}
+
+// Join table now (single membership in MVP), modeled explicitly so
+// multi-organization membership (ROADMAP TODO) doesn't require a schema
+// rewrite later.
+model OrganizationMember {
+  id             String       @id @default(uuid())
+  userId         String
+  organizationId String
+  role           String       @default("OWNER")
+  createdAt      DateTime     @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+}
+
+// A "Partner" is an AI business partner instance scoped to an
+// organization (e.g. "Sales Partner", "Ops Partner") — the chat/memory
+// context is scoped to a Partner, not just to the Organization.
+model Partner {
+  id             String   @id @default(uuid())
+  organizationId String
+  name           String
+  systemPrompt   String   @default("You are a helpful AI business partner. Be concise and practical.")
+  createdAt      DateTime @default(now())
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  memories      Memory[]
+}
+
+model Conversation {
+  id             String   @id @default(uuid())
+  organizationId String
+  partnerId      String
+  title          String   @default("New conversation")
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  partner      Partner      @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  messages     Message[]
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  conversationId String
+  role           String   // "user" | "assistant"
+  content        String
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}
+
+// Simple key-fact memory scoped to a Partner, extracted after each chat
+// turn. Deliberately flat (no vector store) for the MVP — see ROADMAP.
+model Memory {
+  id        String   @id @default(uuid())
+  partnerId String
+  content   String
+  createdAt DateTime @default(now())
+
+  partner Partner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+}
